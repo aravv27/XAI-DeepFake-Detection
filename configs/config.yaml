@@ -1,0 +1,32 @@
+# XAI Configuration Settings
+
+# Model settings
+classification:
+  model: resnet50
+  weights: IMAGENET1K_V2
+  input_size: [224, 224]
+  top_k: 5
+
+segmentation:
+  model: deeplabv3_resnet101
+  weights: COCO_WITH_VOC_LABELS_V1
+  num_classes: 21
+
+# Attention settings
+attention:
+  method: gradcam  # gradcam, gradcam++, scorecam
+  threshold: 0.2   # Top 20% of attention values
+  target_layer: layer4  # For ResNet models
+
+# Visualization settings
+visualization:
+  heatmap_alpha: 0.4
+  segmentation_alpha: 0.5
+  colormap: jet
+  draw_boundaries: true
+  output_dpi: 300
+
+# ImageNet normalization
+preprocessing:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
