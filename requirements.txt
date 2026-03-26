@@ -1,0 +1,16 @@
+# Graph-Guided Explainable Deepfake Detection — v2 Dependencies
+# All packages are HARD requirements. No optional fallbacks.
+
+torch>=2.0
+torchvision>=0.15
+timm>=0.9.0
+grad-cam>=1.5.0
+torch-geometric>=2.3
+scipy>=1.10
+opencv-python>=4.8
+numpy>=1.24
+pillow>=10.0
+matplotlib>=3.7
+tqdm>=4.65
+pyyaml>=6.0
+scikit-learn>=1.3

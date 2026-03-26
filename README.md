@@ -1,84 +1,125 @@
-# Graph-Guided Explainable Deepfake Detection
+# Graph-Guided Explainable Deepfake Detection — v2
 
-An advanced explainable AI system that detects deepfakes and provides human-readable forensic reports. It combines facial segmentation, attention heatmaps, and Graph Attention Networks (GAT) to explain *why* an image is considered fake based on the relationships between facial regions.
+An explainable AI system that detects deepfakes and provides **causally-grounded** forensic reports. Combines facial segmentation, multi-scale attention heatmaps, and Graph Attention Networks (GAT) to explain *why* an image is considered fake based on inconsistencies between facial regions.
+
+## What's New in v2
+
+v2 is a ground-up rewrite fixing critical failures in v1. See [`v2_implementation_plan.md`](v2_implementation_plan.md) for full details.
+
+| Area | v1 | v2 |
+|---|---|---|
+| GAT features | 3/262 dims populated | **10/10 dims fully computed** |
+| BiSeNet | Random weights (silent) | **Pretrained checkpoint required** |
+| Graph edges | Fully connected (noise) | **22 anatomical pairs only** |
+| Explanations | Template thresholds | **GNNExplainer (causal)** |
+| Evaluation | 99.8% on same distribution | **Cross-dataset: Celeb-DF v2 → DF40** |
+| Training safeguards | None | **Gradient checks, early stopping, integration test** |
 
 ## Core Architecture
 
-This system has been upgraded from a generic classifier to a specialized facial forensic tool:
-
-1. **Classification Backbone**: XceptionNet (Binary: Real vs. Fake)
-2. **Feature Localization**: LayerCAM for multi-scale attention (Textures + Semantics)
-3. **Semantic Parsing**: BiSeNet for extracting 19 distinct facial segments (eyes, nose, skin, boundaries)
-4. **Relationship Modeling**: Graph Attention Networks (GAT) to model the consistency between adjacent facial segments.
+```
+Input Image (384×384)
+    ↓
+XceptionNet   →  logits + layer activations
+BiSeNet       →  segment_map (19 classes)        [pretrained weights REQUIRED]
+LayerCAM      →  attention_map (multi-scale)
+NodeExtractor →  node_features (N×10, ALL populated)
+GAT           →  edge_importance
+GNNExplainer  →  causal edge masks
+Report Gen    →  .txt + .json + .png
+```
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd XAI
-
-# Install dependencies (requires PyTorch and PyTorch Geometric)
 pip install -r requirements.txt
 ```
 
+**Required:** Download [BiSeNet CelebAMask-HQ weights](https://drive.google.com/file/d/154JgKpzCPW82qINcVieuPH3fZ2e0P812/view) and place as `checkpoints/bisenet.pth`.
+
 ## Running the Pipeline
 
-### 1. Training (Kaggle Recommended)
-To train the model from scratch on the FaceForensics++ dataset, we highly recommend using a GPU environment like Kaggle.
+### 1. Integration Verification (Required First)
 
-1. Create a new Kaggle Notebook (with GPU T4 x2 enabled).
-2. Upload the `notebooks/kaggle_training.ipynb` file (or copy the contents of `notebooks/kaggle_training.py` into a Script).
-3. Connect the FaceForensics++ dataset to your Kaggle environment.
-4. Run all cells to execute the two-phase training (XceptionNet Pretraining -> Joint GAT Fine-tuning).
-
-### 2. Inference & Explanations
-
-To run the model on a single image and generate a forensic report:
+Before any training, verify the full pipeline works end-to-end:
 
 ```bash
-python inference.py --image path/to/suspect_image.jpg --output results/
+python verify_pipeline.py --image path/to/face.jpg --bisenet-checkpoint checkpoints/bisenet.pth
 ```
 
-**Options:**
-- `--image, -i`: Path to the input image (Required)
-- `--checkpoint, -c`: Path to your trained `.pt` weights
-- `--output, -o`: Directory to save visual results and JSON reports
-- `--device, -d`: strictly use `cuda` or `cpu` (default: auto-detect)
-- `--no-viz`: Run headless without displaying the matplotlib popup
+All 5 checks must pass before training can proceed.
+
+### 2. Training (Kaggle GPU Recommended)
+
+**Option A: Kaggle Notebook**
+1. Upload this repo as a Kaggle dataset
+2. Attach [Celeb-DF v2](https://www.kaggle.com/datasets/pranabr0y/celebdf-v2image-dataset) dataset
+3. Upload BiSeNet checkpoint as a dataset
+4. Run `notebooks/kaggle_training.py` with GPU T4 x2 enabled
+
+**Option B: Local Training**
+```bash
+python train.py --mode full --data-root path/to/celebdf --bisenet-checkpoint checkpoints/bisenet.pth
+```
+
+**Training modes** (for ablation):
+- `--mode xception_only` — baseline classifier, no graph
+- `--mode full` — XceptionNet + GAT joint training
+- `--mode gat_only` — sanity check; should underperform xception_only
+
+### 3. Inference & Explanations
+
+```bash
+python inference.py \
+    --image path/to/suspect.jpg \
+    --checkpoint checkpoints/phase2_best.pt \
+    --bisenet-checkpoint checkpoints/bisenet.pth \
+    --output results/
+```
 
 ## Understanding the Outputs
 
-For every image processed through `inference.py`, the system generates:
+For every image, the system generates:
 
-1. **`{image}_analysis.png`**: A 2x2 visual dashboard containing:
-   - The original image
-   - The LayerCAM attention heatmap (where the model is looking)
-   - The BiSeNet face segmentation map
-   - A text summary of the top suspicious facial relationships
-2. **`{image}_explanation.txt`**: A detailed, human-readable forensic report explaining the model's reasoning (e.g., *"Texture inconsistency at skin ↔ left_eye junction"*). 
-3. **`{image}_result.json`**: A structured JSON file containing the raw confidence scores, segmentation breakdowns, and GAT edge importance metrics for API integration.
+1. **`{image}_analysis.png`** — 4-panel dashboard: original, LayerCAM heatmap, segmentation map, analysis summary
+2. **`{image}_explanation.txt`** — Human-readable forensic report with causal edge importance
+3. **`{image}_result.json`** — Structured data with GNNExplainer edge masks, segment info, and classification confidence
 
 ## Project Structure
 
 ```
 XAI/
 ├── data/
-│   └── ff_dataset.py      # FaceForensics++ data loaders & augmentation
+│   └── dataset.py             # Celeb-DF v2 + DF40 DataLoaders
 ├── models/
-│   ├── xception.py        # Backbone Classifier
-│   ├── attention.py       # LayerCAM Multi-scale Attention
-│   ├── face_parser.py     # BiSeNet Segmentation
-│   └── gat_explainer.py   # Graph Attention Network
+│   ├── xception.py            # XceptionNet classifier + LayerCAM hooks
+│   ├── attention.py           # LayerCAM multi-scale attention
+│   ├── face_parser.py         # BiSeNet segmentation + anatomical graph
+│   └── gat_explainer.py       # GAT + NodeFeatureExtractor (10 dims)
 ├── utils/
-│   ├── explanation.py     # NLG rule-engine for forensic reports
-│   └── visualization.py   # Heatmap and Graph rendering
+│   ├── explanation.py         # GNNExplainer + report generation
+│   └── visualization.py       # 4-panel dashboard rendering
 ├── notebooks/
-│   └── kaggle_training.ipynb # Ready-to-run GPU training notebook
-├── train.py               # Local two-phase training script
-├── inference.py           # End-to-end inference & explanation CLI
-└── requirements.txt
+│   └── kaggle_training.py     # Ready-to-run Kaggle training script
+├── verify_pipeline.py         # Integration test (must pass before training)
+├── train.py                   # Two-phase trainer with gradient checks
+├── inference.py               # End-to-end inference + CLI
+├── requirements.txt           # Hard dependencies
+├── techRef.md                 # v1 technical reference (baseline)
+└── v2_implementation_plan.md  # v2 architecture contracts
 ```
 
-## Future Enhancements (Phase 2)
-See `implementation_plan_v2.md` for our upcoming roadmap, which includes Temporal Video Analysis (ST-GAT) and an interactive Streamlit forensic dashboard.
+## Datasets
+
+| Dataset | Purpose | Source |
+|---|---|---|
+| Celeb-DF v2 | Training + validation | [Kaggle](https://www.kaggle.com/datasets/pranabr0y/celebdf-v2image-dataset) |
+| DF40 | Cross-dataset evaluation (40 methods) | [HuggingFace](https://huggingface.co/datasets/aibio-aotearoa/DF40_test_subset) |
+
+## Evaluation Metrics
+
+- **AUC-ROC** — primary detection metric
+- **F1 Score** — balanced comparison metric
+- **Cross-dataset gap** — (Celeb-DF AUC) − (DF40 AUC) — key research finding
