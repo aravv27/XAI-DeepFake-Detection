@@ -156,9 +156,10 @@ class DeepfakeInference:
         else:
             filt_edge = np.zeros((2, 0), dtype=np.int64)
 
-        # --- 7. GNNExplainer ---
+        # --- 7. Explain edge importance ---
         edge_mask = np.zeros(filt_edge.shape[1], dtype=np.float32)
         explainer_success = False
+        explainer_method = "none"
 
         if features.shape[0] >= 2 and filt_edge.shape[1] > 0:
             data = build_pyg_data(features, filt_edge, label=pred_class)
@@ -167,6 +168,7 @@ class DeepfakeInference:
             explain_result = explain_graph(self.gat, data, target_class=pred_class)
             edge_mask = explain_result["edge_mask"]
             explainer_success = explain_result["success"]
+            explainer_method = explain_result.get("method", "unknown")
 
         # --- 8. Generate reports ---
         seg_info = self.face_parser.get_segment_info(segment_map)
@@ -180,6 +182,7 @@ class DeepfakeInference:
             segment_ids=valid_ids,
             explainer_success=explainer_success,
             image_path=image_path,
+            explainer_method=explainer_method,
         )
 
         # Save

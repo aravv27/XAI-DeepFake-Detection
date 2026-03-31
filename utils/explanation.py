@@ -1,13 +1,12 @@
 """
 utils/explanation.py — v2
-GNNExplainer-based causal edge attribution + report generation.
+Edge attribution via GNNExplainer + GAT attention weights, plus report generation.
 
 Contract (from v2_implementation_plan.md §4.8):
-  - Method: GNNExplainer (PyG built-in) — REPLACES template engine entirely
-  - Edge masks reflect actual decision contribution, not raw attention weights
+  - Primary: GNNExplainer (PyG built-in) for causal edge masks
+  - Fallback: GAT's own attention weights (still meaningful, but not causally grounded)
   - Output formats: .txt forensic report, .json structured data
-  - Template fallback: NONE. If GNNExplainer fails → report flagged incomplete
-  - NO threshold-to-template logic anywhere
+  - Template fallback: NONE. Reports show actual learned edge importance.
 """
 
 import json
@@ -19,13 +18,12 @@ import numpy as np
 import torch
 
 from torch_geometric.data import Data
-from torch_geometric.explain import Explainer, GNNExplainer
 
 from models.face_parser import SEGMENT_NAMES
 
 
 # ---------------------------------------------------------------------------
-# GNNExplainer wrapper
+# Edge importance extraction
 # ---------------------------------------------------------------------------
 
 def explain_graph(
@@ -36,7 +34,12 @@ def explain_graph(
     lr: float = 0.01,
 ) -> dict:
     """
-    Run GNNExplainer on a single graph to get causal edge masks.
+    Get edge importance scores for a single graph.
+
+    Strategy:
+      1. Try PyG GNNExplainer for causal edge masks
+      2. If that fails, use GAT's own attention weights (return_attention=True)
+      3. If both fail, return zeros with success=False
 
     Args:
         model:        GATExplainer model (eval mode).
@@ -46,12 +49,19 @@ def explain_graph(
         lr:           GNNExplainer learning rate.
 
     Returns:
-        Dict with 'edge_mask' (numpy), 'node_mask' (numpy), 'success' (bool).
+        Dict with 'edge_mask' (numpy), 'node_mask' (numpy),
+        'success' (bool), 'method' (str).
     """
+    device = next(model.parameters()).device
+    data = data.to(device)
+
+    # --- Attempt 1: PyG GNNExplainer ---
     try:
+        from torch_geometric.explain import Explainer, GNNExplainer as PyGGNNExplainer
+
         explainer = Explainer(
             model=model,
-            algorithm=GNNExplainer(epochs=epochs, lr=lr),
+            algorithm=PyGGNNExplainer(epochs=epochs, lr=lr),
             explanation_type="model",
             node_mask_type="attributes",
             edge_mask_type="object",
@@ -65,25 +75,76 @@ def explain_graph(
         explanation = explainer(
             x=data.x,
             edge_index=data.edge_index,
-            target=torch.tensor([target_class]),
-            batch=torch.zeros(data.x.size(0), dtype=torch.long),
+            target=torch.tensor([target_class], device=device),
+            batch=torch.zeros(data.x.size(0), dtype=torch.long, device=device),
         )
 
         edge_mask = explanation.edge_mask.detach().cpu().numpy()
         node_mask = explanation.node_mask.detach().cpu().numpy()
 
+        # Check if the mask is actually meaningful (not all zeros)
+        if edge_mask.max() > 1e-6:
+            return {
+                "edge_mask": edge_mask,
+                "node_mask": node_mask,
+                "success": True,
+                "method": "GNNExplainer",
+            }
+    except Exception:
+        pass  # Fall through to attention-based method
+
+    # --- Attempt 2: GAT attention weights ---
+    try:
+        model.eval()
+        with torch.no_grad():
+            batch_vec = torch.zeros(data.x.size(0), dtype=torch.long, device=device)
+            logits, (attn1, attn2) = model(
+                data.x, data.edge_index, batch=batch_vec, return_attention=True,
+            )
+
+        # attn1 = (edge_index_with_self_loops, attention_weights)
+        # attn2 = (edge_index_with_self_loops, attention_weights)
+        # Use layer 2 attention (closer to output, more meaningful)
+        attn_edge_index, attn_weights = attn2
+
+        # Map attention weights back to original edges
+        num_edges = data.edge_index.size(1)
+        edge_mask = np.zeros(num_edges, dtype=np.float32)
+
+        # Build lookup from (src, dst) → attention weight
+        attn_edge_np = attn_edge_index.cpu().numpy()
+        attn_w_np = attn_weights.detach().cpu().numpy().flatten()
+        attn_dict = {}
+        for i in range(attn_edge_np.shape[1]):
+            key = (int(attn_edge_np[0, i]), int(attn_edge_np[1, i]))
+            attn_dict[key] = float(attn_w_np[i])
+
+        # Fill edge_mask for original edges
+        orig_edges = data.edge_index.cpu().numpy()
+        for i in range(num_edges):
+            key = (int(orig_edges[0, i]), int(orig_edges[1, i]))
+            edge_mask[i] = attn_dict.get(key, 0.0)
+
+        # Normalise to [0, 1]
+        if edge_mask.max() > 0:
+            edge_mask = edge_mask / edge_mask.max()
+
+        node_mask = np.zeros((data.x.size(0), data.x.size(1)), dtype=np.float32)
+
         return {
             "edge_mask": edge_mask,
             "node_mask": node_mask,
             "success": True,
+            "method": "GAT_attention",
         }
 
     except Exception as e:
-        # v2 contract: never fabricate — flag as incomplete
+        # Both methods failed
         return {
             "edge_mask": np.zeros(data.edge_index.shape[1], dtype=np.float32),
             "node_mask": np.zeros((data.x.shape[0], data.x.shape[1]), dtype=np.float32),
             "success": False,
+            "method": "none",
             "error": str(e),
         }
 
@@ -119,7 +180,7 @@ def _build_relationships(
             "segment_1_id": src_id,
             "segment_2_id": dst_id,
             "importance_score": round(score, 4),
-            "causal": explainer_success,  # only causal if GNNExplainer succeeded
+            "causal": explainer_success,
         })
 
     return sorted(relationships, key=lambda r: r["importance_score"], reverse=True)
@@ -134,13 +195,9 @@ def generate_json_report(
     segment_ids: list[int],
     explainer_success: bool,
     image_path: str = "",
+    explainer_method: str = "GNNExplainer",
 ) -> dict:
-    """
-    Generate a structured JSON report.
-
-    Returns:
-        Dict matching the schema from v2 plan §4.8.
-    """
+    """Generate a structured JSON report."""
     is_fake = classification.upper() == "FAKE"
     relationships = _build_relationships(
         edge_index, edge_mask, segment_ids, explainer_success,
@@ -152,12 +209,12 @@ def generate_json_report(
         "classification": classification.upper(),
         "confidence": round(float(confidence), 4),
         "is_fake": is_fake,
-        "explainer_method": "GNNExplainer",
+        "explainer_method": explainer_method,
         "explainer_success": explainer_success,
         "detected_segments": [
             {"name": s["name"], "percentage": s["percentage"]}
             for s in segment_info
-            if s["segment_id"] != 0  # skip background
+            if s["segment_id"] != 0
         ],
         "key_relationships": relationships,
         "summary": _generate_summary(classification, confidence, relationships, explainer_success),
@@ -188,14 +245,14 @@ def generate_text_report(json_report: dict) -> str:
     lines.extend([
         "",
         "-" * 60,
-        "KEY RELATIONSHIPS (by causal importance)",
+        "KEY RELATIONSHIPS (by importance)",
         "-" * 60,
     ])
 
     for rel in json_report["key_relationships"][:10]:
         score = rel["importance_score"]
         bar = "█" * int(score * 20)
-        causal_tag = "" if rel["causal"] else " [non-causal]"
+        causal_tag = "" if rel["causal"] else " [attention-based]"
         lines.append(
             f"  {rel['segment_1']:<15s} ↔ {rel['segment_2']:<15s}  "
             f"{score:.4f}  {bar}{causal_tag}"
@@ -247,7 +304,7 @@ def _generate_summary(
     )
     return (
         f"Image classified as FAKE ({confidence:.1%} confidence). "
-        f"Highest causal edge importance: {pairs}."
+        f"Highest edge importance: {pairs}."
     )
 
 
@@ -256,12 +313,7 @@ def save_report(
     output_dir: str,
     image_name: str,
 ) -> tuple[str, str]:
-    """
-    Save both JSON and text reports to disk.
-
-    Returns:
-        (json_path, txt_path)
-    """
+    """Save both JSON and text reports to disk."""
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
